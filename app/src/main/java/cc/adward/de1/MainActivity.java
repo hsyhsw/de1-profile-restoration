@@ -176,6 +176,7 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void updateProfileLibraryFromGithub() {
+        StringBuilder toastMsg = new StringBuilder();
         ProgressDialog p = ProgressDialog.show(this, "Profile Update", "Updating profile library...");
         AsyncTask.execute(() -> {
             try {
@@ -185,8 +186,10 @@ public class MainActivity extends AppCompatActivity
                     if (fetchedLib.getVersion() > pl.getVersion()) {
                         Log.i("profile-update", String.format("Updating profile library: %d -> %d", pl.getVersion(), fetchedLib.getVersion()));
                         installProfileLibrary(fetchedLib);
+                        toastMsg.append(String.format("Profile library updated to %d", fetchedLib.getVersion()));
                     } else {
                         Log.i("profile-update", String.format("Abort updating: %d -> %d", pl.getVersion(), fetchedLib.getVersion()));
+                        toastMsg.append("Current profile library is the latest!");
                     }
                 }
             } catch (IOException | JSONException e) {
@@ -195,6 +198,7 @@ public class MainActivity extends AppCompatActivity
                 runOnUiThread(() -> {
                     refreshTagSpinner();
                     p.dismiss();
+                    Toast.makeText(this, toastMsg.toString(), Toast.LENGTH_SHORT).show();
                 });
             }
         });
