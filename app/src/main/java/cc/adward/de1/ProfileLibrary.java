@@ -149,6 +149,9 @@ public class ProfileLibrary implements Serializable {
                 t.getProfiles().add(p);
             }
         }
+        if (newTags.size() != 0) {
+            version = Long.parseLong(new SimpleDateFormat("yyyyMMddHHmm").format(new Date()));
+        }
         tags.putAll(newTags);
     }
 
