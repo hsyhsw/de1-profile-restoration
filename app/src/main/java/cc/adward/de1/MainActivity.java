@@ -2,15 +2,19 @@ package cc.adward.de1;
 
 import android.app.ProgressDialog;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Bundle;
 import android.support.v4.provider.DocumentFile;
-import android.support.v7.app.ActionBar;
 import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
 import android.util.SparseBooleanArray;
+import android.view.Menu;
+import android.view.MenuInflater;
+import android.view.MenuItem;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -23,7 +27,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.apache.commons.io.IOUtils;
+import org.json.JSONException;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -44,6 +50,10 @@ public class MainActivity extends AppCompatActivity
 
     public static final String PROFILE_DIR_NAME = "profiles";
 
+    private static final String PREF_INSTALLATION_URI_KEY = "de1-installation-dir-key";
+
+    private SharedPreferences sharedPref;
+
     private ContentResolver contentResolver;
     private DocumentFile de1Installation;
     private DocumentFile profileDir;
@@ -51,18 +61,15 @@ public class MainActivity extends AppCompatActivity
     private ProfileLibrary pl;
     private BackupArchive backupArchive;
 
-    private ActionBar topToolbar;
-
     private TextView de1Path;
 
     private Spinner tagSelector;
     private List<Tag> tags;
+    private List<String> tagLabels;
 
     private ListView tagProfileList;
     private List<Map<String, String>> tagProfiles;
 
-    private Button selectAllButton;
-    private Button deselectAllButton;
     private Button restoreButton;
 
     private Spinner backupSelector;
@@ -77,9 +84,8 @@ public class MainActivity extends AppCompatActivity
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        topToolbar = getSupportActionBar();
-        // topToolbar.view
-        // TODO: self update profile library from github HEAD commit
+        contentResolver = getContentResolver();
+        sharedPref = getPreferences(Context.MODE_PRIVATE);
 
         // top: de1 installation picker
         de1Path = findViewById(R.id.de1_dir_path);
@@ -88,19 +94,6 @@ public class MainActivity extends AppCompatActivity
         // left: tags, available profiles
         tagSelector = findViewById(R.id.tag_selector);
         tagProfileList = findViewById(R.id.tag_profiles);
-
-        try (InputStream in = getResources().openRawResource(R.raw.profiles_json_gz)) {
-            pl = ProfileLibrary.load(in);
-        } catch (IOException e) {
-            Log.w("ProfileLibrary", e);
-        }
-        tags = pl.tagsAsList();
-        DateFormat df = new SimpleDateFormat("yyyy/MM/dd", Locale.getDefault(Locale.Category.FORMAT));
-        List<String> tagLabels = tags.stream()
-                .map(t -> String.format("%s at %s, %d profile(s)", t.getName(), df.format(t.getDate()), t.getProfiles().size()))
-                .collect(Collectors.toList());
-        tagSelector.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, tagLabels));
-        tagSelector.setOnItemSelectedListener(this);
 
         // bottom buttons
         findViewById(R.id.btn_select_all).setOnClickListener(this);
@@ -120,8 +113,6 @@ public class MainActivity extends AppCompatActivity
                 new String[]{"profileName", "fileName"},
                 new int[]{android.R.id.text1, android.R.id.text2}));
 
-        contentResolver = getContentResolver();
-
         tagProfiles = new ArrayList<>();
         tagProfileList.setAdapter(new SimpleAdapter(this, tagProfiles,
                 android.R.layout.simple_list_item_activated_2,
@@ -130,6 +121,93 @@ public class MainActivity extends AppCompatActivity
 
         // backup selection spinner
         backupSelector = findViewById(R.id.backup_selector);
+
+        // tag spinner
+        tagLabels = new ArrayList<>();
+        tagSelector.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, tagLabels));
+        tagSelector.setOnItemSelectedListener(this);
+
+        if (sharedPref.getString(PREF_INSTALLATION_URI_KEY, null) != null) {
+            Uri installationUri = Uri.parse(sharedPref.getString(PREF_INSTALLATION_URI_KEY, null));
+            Log.i("preference", "Installation directory found: " + installationUri.toString());
+            de1Installation = DocumentFile.fromTreeUri(this, installationUri);
+            onCorrectInstallationDir();
+        }
+    }
+
+    private ProfileLibrary loadStockProfileLibrary() throws IOException {
+        try (InputStream in = getResources().openRawResource(R.raw.profiles_json_gz)) {
+            return ProfileLibrary.load(in);
+        }
+    }
+
+    private DocumentFile installProfileLibrary(ProfileLibrary lib) throws IOException {
+        DocumentFile backupDir = backupArchive.getBackupDir();
+        DocumentFile installedLib = backupDir.findFile(ProfileLibrary.PROFILE_LIB_FILE);
+        if (installedLib == null) { // ensure installed profile library exists
+            installedLib = backupDir.createFile("application/profile_library", ProfileLibrary.PROFILE_LIB_FILE);
+        }
+        try (OutputStream out = contentResolver.openOutputStream(installedLib.getUri(), "wt")) {
+            lib.save(out);
+        }
+        return installedLib;
+    }
+
+    private void initProfileLibrary() throws IOException {
+        DocumentFile backupDir = backupArchive.getBackupDir();
+        DocumentFile installedLib = backupDir.findFile(ProfileLibrary.PROFILE_LIB_FILE);
+        if (installedLib == null) { // ensure installed profile library exists
+            // copy app-distributed profile lib
+            installedLib = installProfileLibrary(loadStockProfileLibrary());
+        }
+        // load installed lib anyway...
+        try (InputStream in = contentResolver.openInputStream(installedLib.getUri())) {
+            pl = ProfileLibrary.load(in);
+            Log.i("profile-library", String.format("Profile library installed: v%d", pl.getVersion()));
+        } catch (IOException e) {
+            Log.w("profile-library", e);
+        }
+
+        ProfileLibrary maybeNewer = loadStockProfileLibrary();
+        if (maybeNewer.getVersion() > pl.getVersion()) {
+            Log.i("profile-library", "Stock profile library is newer!");
+            installProfileLibrary(maybeNewer);
+        }
+    }
+
+    private void updateProfileLibraryFromGithub() {
+        ProgressDialog p = ProgressDialog.show(this, "Profile Update", "Updating profile library...");
+        AsyncTask.execute(() -> {
+            try {
+                byte[] latestLib = ProfileLibrary.fetchLatestLibRelease();
+                try (InputStream in = new ByteArrayInputStream(latestLib)) {
+                    ProfileLibrary fetchedLib = ProfileLibrary.load(in);
+                    if (fetchedLib.getVersion() > pl.getVersion()) {
+                        Log.i("profile-update", String.format("Updating profile library: %d -> %d", pl.getVersion(), fetchedLib.getVersion()));
+                        installProfileLibrary(fetchedLib);
+                    } else {
+                        Log.i("profile-update", String.format("Abort updating: %d -> %d", pl.getVersion(), fetchedLib.getVersion()));
+                    }
+                }
+            } catch (IOException | JSONException e) {
+                Log.w("profile-update", e);
+            } finally {
+                runOnUiThread(() -> {
+                    refreshTagSpinner();
+                    p.dismiss();
+                });
+            }
+        });
+    }
+
+    private void refreshTagSpinner() {
+        tags = pl.tagsAsList();
+        DateFormat df = new SimpleDateFormat("yyyy/MM/dd", Locale.getDefault(Locale.Category.FORMAT));
+        tagLabels.clear();
+        tagLabels.addAll(tags.stream()
+                .map(t -> String.format("%s at %s, %d profile(s)", t.getName(), df.format(t.getDate()), t.getProfiles().size()))
+                .collect(Collectors.toList()));
+        ((BaseAdapter) tagSelector.getAdapter()).notifyDataSetChanged();
     }
 
     private void requestDe1Installation() {
@@ -140,7 +218,7 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void populateInstalledProfiles() {
-        Log.i("listing-profiles", de1Installation.getUri().toString());
+        Log.i("listing-profile", de1Installation.getUri().toString());
         installedProfiles.clear();
         for (DocumentFile f : profileDir.listFiles()) {
             try (InputStream in = contentResolver.openInputStream(f.getUri())) {
@@ -150,10 +228,10 @@ public class MainActivity extends AppCompatActivity
                 item.put("fileName", "File name: " + f.getName());
                 installedProfiles.add(item);
             } catch (IOException e) {
-                Log.w("de1-profiles", e);
+                Log.w("listing-profile", e);
             }
         }
-        Log.i("listing-profiles", String.format("%d profiles available", installedProfiles.size()));
+        Log.i("listing-profile", String.format("%d profiles available", installedProfiles.size()));
         ((BaseAdapter) installedProfileList.getAdapter()).notifyDataSetChanged();
     }
 
@@ -177,42 +255,58 @@ public class MainActivity extends AppCompatActivity
         }
     }
 
+    private void onCorrectInstallationDir() {
+        de1Path.setEnabled(false);
+        // initialize backup archive
+        profileDir = de1Installation.findFile(PROFILE_DIR_NAME);
+        backupArchive = new BackupArchive(this, de1Installation);
+        if (backupArchive.listBackups().size() == 0) {
+            backupArchive.newBackup(profileDir);
+        }
+        backupSelector.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, backupArchive.listBackups()));
+
+        // initialize profile library
+        try {
+            initProfileLibrary();
+        } catch (IOException e) {
+            Log.w("profile-library", e);
+        }
+        refreshTagSpinner();
+
+        // extract version
+        Uri versionFile = de1Installation.findFile("version.tcl").getUri();
+        try (Scanner sc = new Scanner(contentResolver.openInputStream(versionFile))) {
+            String de1Version = sc.nextLine().split("\\s")[3];
+            de1Path.setText("DE1 v" + de1Version);
+            // select best matching tag
+            for (int i = 0; i < tagSelector.getAdapter().getCount(); ++i) {
+                String str = (String) tagSelector.getAdapter().getItem(i);
+                // XXX: cute hack to autoselecting installed version
+                if (str.startsWith(de1Version + " at") || str.startsWith("v" + de1Version + " at")) {
+                    tagSelector.setSelection(i);
+                    break;
+                }
+            }
+        } catch (IOException e) {
+            Log.w("de1-version", e);
+        }
+
+        populateInstalledProfiles();
+        restoreButton.setEnabled(true);
+        backupButton.setEnabled(true);
+        restoreFromBackupButton.setEnabled(true);
+    }
+
     private void handleDe1InstallationResult(Uri installationUri) {
         de1Installation = DocumentFile.fromTreeUri(this, installationUri);
         if (de1Installation.isFile() || de1Installation.findFile("version.tcl") == null) {
             Toast.makeText(this, "Pick correct installation folder!", Toast.LENGTH_SHORT).show();
             requestDe1Installation();
         } else {
-            de1Path.setEnabled(false);
-            // initialize backup archive
-            profileDir = de1Installation.findFile(PROFILE_DIR_NAME);
-            backupArchive = new BackupArchive(this, de1Installation);
-            if (backupArchive.listBackups().size() == 0) {
-                backupArchive.newBackup(profileDir);
-            }
-            backupSelector.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, backupArchive.listBackups()));
-
-            // extract version
-            Uri versionFile = de1Installation.findFile("version.tcl").getUri();
-            try (Scanner sc = new Scanner(contentResolver.openInputStream(versionFile))) {
-                String de1Version = sc.nextLine().split("\\s")[3];
-                de1Path.setText("DE1 v" + de1Version);
-                // select best matching tag
-                for (int i = 0; i < tagSelector.getAdapter().getCount(); ++i) {
-                    String str = (String) tagSelector.getAdapter().getItem(i);
-                    // cute hack to autoselecting installed version
-                    if (str.startsWith(de1Version + " at") || str.startsWith("v" + de1Version + " at")) {
-                        tagSelector.setSelection(i);
-                        break;
-                    }
-                }
-            } catch (IOException e) {
-                Log.w("de1-version", e);
-            }
-            populateInstalledProfiles();
-            restoreButton.setEnabled(true);
-            backupButton.setEnabled(true);
-            restoreFromBackupButton.setEnabled(true);
+            sharedPref.edit()
+                    .putString(PREF_INSTALLATION_URI_KEY, installationUri.toString())
+                    .apply();
+            onCorrectInstallationDir();
         }
     }
 
@@ -241,8 +335,10 @@ public class MainActivity extends AppCompatActivity
                     restoreFromTagProfile(p);
                 }
             }
-            runOnUiThread(this::populateInstalledProfiles);
-            progress.dismiss();
+            runOnUiThread(() -> {
+                populateInstalledProfiles();
+                progress.dismiss();
+            });
         });
 
     }
@@ -251,8 +347,10 @@ public class MainActivity extends AppCompatActivity
         ProgressDialog progress = ProgressDialog.show(this, "Backup", "Backing up profiles...");
         AsyncTask.execute(() -> {
             backupArchive.newBackup(profileDir);
-            runOnUiThread(() -> ((BaseAdapter) backupSelector.getAdapter()).notifyDataSetChanged());
-            progress.dismiss();
+            runOnUiThread(() -> {
+                ((BaseAdapter) backupSelector.getAdapter()).notifyDataSetChanged();
+                progress.dismiss();
+            });
         });
     }
 
@@ -261,8 +359,10 @@ public class MainActivity extends AppCompatActivity
         AsyncTask.execute(() -> {
             Backup b = (Backup) backupSelector.getSelectedItem();
             backupArchive.restoreFrom(b, profileDir);
-            runOnUiThread(this::populateInstalledProfiles);
-            progress.dismiss();
+            runOnUiThread(() -> {
+                populateInstalledProfiles();
+                progress.dismiss();
+            });
         });
     }
 
@@ -314,6 +414,21 @@ public class MainActivity extends AppCompatActivity
             }
             ((BaseAdapter) tagProfileList.getAdapter()).notifyDataSetChanged();
         }
+    }
+
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        MenuInflater inflater = getMenuInflater();
+        inflater.inflate(R.menu.actionbar, menu);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == R.id.action_selfupdate) {
+            updateProfileLibraryFromGithub();
+        }
+        return true;
     }
 
     @Override

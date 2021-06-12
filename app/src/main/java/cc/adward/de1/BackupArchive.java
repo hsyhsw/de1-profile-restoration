@@ -43,6 +43,10 @@ public class BackupArchive {
         listBackups();
     }
 
+    public DocumentFile getBackupDir() {
+        return backupDir;
+    }
+
     public List<Backup> listBackups() {
         if (backups != null) {
             return backups;

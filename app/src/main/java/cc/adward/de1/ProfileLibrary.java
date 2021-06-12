@@ -8,6 +8,9 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.apache.commons.io.IOUtils;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 import org.kohsuke.github.GHContent;
 import org.kohsuke.github.GHRepository;
 import org.kohsuke.github.GHTag;
@@ -22,7 +25,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -52,16 +57,20 @@ public class ProfileLibrary implements Serializable {
     private HttpClient httpClient;
 
     @JsonProperty
+    private Long version; // yyyyMMddHHmm
+    @JsonProperty
     private Map<String, Tag> tags; // {tag_sha : tag}
     @JsonProperty
     private Map<String, byte[]> contentCache; // {profile_sha : content_bytes}
 
     public ProfileLibrary() {
+        this.version = Long.parseLong(new SimpleDateFormat("yyyyMMddHHmm").format(new Date()));
         this.tags = new HashMap<>();
         this.contentCache = new HashMap<>();
     }
 
-    public ProfileLibrary(Map<String, Tag> tags, Map<String, byte[]> contentCache) {
+    public ProfileLibrary(Long version, Map<String, Tag> tags, Map<String, byte[]> contentCache) {
+        this.version = version;
         this.tags = tags;
         this.contentCache = contentCache;
     }
@@ -76,6 +85,10 @@ public class ProfileLibrary implements Serializable {
             de1Repo = null;
             httpClient = null;
         }
+    }
+
+    public Long getVersion() {
+        return version;
     }
 
     private Map<String, Tag> fetchNewTags() throws IOException {
@@ -184,6 +197,46 @@ public class ProfileLibrary implements Serializable {
         try (OutputStream out = Files.newOutputStream(Paths.get(path))) {
             save(out);
         }
+    }
+
+    public static byte[] fetchLatestLibRelease() throws IOException, JSONException {
+        final String releaseUrl = "https://api.github.com/repos/hsyhsw/de1-profile-restoration/releases";
+
+        // list pre-release and find the latest
+        HttpClient http = HttpClientBuilder.create().build();
+        HttpGet getReq = new HttpGet(releaseUrl);
+        HttpResponse res = http.execute(getReq);
+        long latestVersion = 0;
+        String downloadUrl = null;
+        if (res.getStatusLine().getStatusCode() == 200) {
+            try (InputStream in = res.getEntity().getContent()) {
+                String jsonStr = IOUtils.toString(in, "UTF-8");
+                JSONArray rels = new JSONArray(jsonStr);
+                for (int i = 0; i < rels.length(); ++i) {
+                    JSONObject o = rels.getJSONObject(i);
+                    if (o.getBoolean("prerelease")) {
+                        long version = Long.parseLong(o.getString("tag_name"));
+                        String url = o.getJSONArray("assets").getJSONObject(0).getString("browser_download_url");
+                        if (version > latestVersion) {
+                            latestVersion = version;
+                            downloadUrl = url;
+                        }
+                    }
+                }
+            }
+        }
+
+        // download latest and return it
+        if (downloadUrl != null) {
+            res = http.execute(new HttpGet(downloadUrl));
+            if (res.getStatusLine().getStatusCode() == 200) {
+                try (InputStream in = res.getEntity().getContent()) {
+                    return IOUtils.toByteArray(in);
+                }
+            }
+        }
+
+        return null;
     }
 }
 
